@@ -1,1 +1,146 @@
+import pandas as pd
+import json
+import os
+import re
+
+INPUT = "TMDB_movie_dataset_v11.csv"
+OUTPUT = "TMDB_movie_dataset_cleaned.csv"
+
+df = pd.read_csv(INPUT, low_memory=False)
+n_start = len(df)
+log = {"rows_start": n_start}
+
+# 1. Xoa cac dong trung lap hoan toan (moi cot giong nhau)
+before = len(df)
+df = df.drop_duplicates()
+log["dropped_full_duplicate_rows"] = before - len(df)
+
+# 2. Xoa cac dong trung id, chi giu dong xuat hien dau tien
+before = len(df)
+df = df.drop_duplicates(subset=["id"], keep="first")
+log["dropped_duplicate_id_rows"] = before - len(df)
+
+# 3. Xoa cac dong khong co ten phim (title trong/rong)
+before = len(df)
+title_is_missing = df["title"].isna() | (df["title"].astype(str).str.strip() == "")
+df = df[~title_is_missing].copy()
+df["title"] = df["title"].astype(str).str.strip()
+log["dropped_missing_title_rows"] = before - len(df)
+
+# 3b. [MOI THEM] Xoa cac dong ma "title" chi toan ky hieu / dau cau, khong
+#     phai ten phim that (vi du: "$", ",", "*", "!", "△▽", "()", "...", "-").
+#     Dieu kien: sau khi bo khoang trang, TOAN BO ky tu trong title deu KHONG
+#     phai chu cai/chu so (o bat ky ngon ngu nao) -> coi la rac, xoa luon.
+before = len(df)
+title_has_no_alnum = df["title"].apply(lambda t: not any(ch.isalnum() for ch in str(t)))
+log["dropped_symbol_only_title_rows"] = int(title_has_no_alnum.sum())
+df = df[~title_has_no_alnum].copy()
+assert len(df) == before - log["dropped_symbol_only_title_rows"]
+
+# 4. Tach nam phat hanh (release_year) tu ngay phat hanh (release_date)
+df["release_date"] = pd.to_datetime(df["release_date"], errors="coerce")
+df["release_year"] = df["release_date"].dt.year
+
+# 5. Gom nhom cac phim "giong nhau" theo (title, release_year)
+#    trong moi nhom trung nhau, chi giu lai 1 dong: uu tien du lieu day du nhat,
+#    sau do uu tien vote_count (luot danh gia) cao hon
+has_year = df["release_year"].notna()
+dup_pool = df[has_year].copy()
+no_year_pool = df[~has_year].copy()
+
+before = len(dup_pool)
+completeness = dup_pool.notna().sum(axis=1)
+dup_pool["_score"] = completeness * 1000 + dup_pool["vote_count"].fillna(0)
+dup_pool = dup_pool.sort_values("_score", ascending=False)
+dup_pool = dup_pool.drop_duplicates(subset=["title", "release_year"], keep="first")
+dup_pool = dup_pool.drop(columns="_score")
+log["dropped_same_title_year_duplicates"] = before - len(dup_pool)
+
+df = pd.concat([dup_pool, no_year_pool], ignore_index=True)
+
+# 5c. [MOI THEM] Gop cac dong bi trung theo ma IMDb (imdb_id) thanh 1 dong.
+#     CHI xet cac dong CO imdb_id that su (khong rong/NaN) - phai lam truoc
+#     buoc 6 (dien "Unknown"), neu khong thi tat ca cac dong thieu imdb_id se
+#     bi coi la "Unknown" == "Unknown" -> trung nhau -> gop nham hang tram
+#     nghin phim khac nhau thanh 1 dong (loi giong het kieu loi o buoc 8 cu).
+#     Trong moi nhom imdb_id trung nhau: giu dong day du du lieu nhat, neu
+#     hoa thi giu dong co vote_count cao hon.
+before = len(df)
+has_imdb = df["imdb_id"].notna() & (df["imdb_id"].astype(str).str.strip() != "")
+imdb_pool = df[has_imdb].copy()
+no_imdb_pool = df[~has_imdb].copy()
+
+completeness_imdb = imdb_pool.notna().sum(axis=1)
+imdb_pool["_score"] = completeness_imdb * 1000 + imdb_pool["vote_count"].fillna(0)
+imdb_pool = imdb_pool.sort_values("_score", ascending=False)
+imdb_pool = imdb_pool.drop_duplicates(subset=["imdb_id"], keep="first")
+imdb_pool = imdb_pool.drop(columns="_score")
+
+df = pd.concat([imdb_pool, no_imdb_pool], ignore_index=True)
+log["merged_duplicate_imdb_id_rows"] = before - len(df)
+
+# 6. Dien "Unknown" cho cac truong van ban con thieu
+for col in ["genres", "production_companies", "production_countries", "spoken_languages",
+            "keywords", "overview", "tagline", "imdb_id"]:
+    df[col] = df[col].fillna("Unknown")
+
+# 7. Chuan hoa lai release_year / release_date
+df["release_year"] = df["release_year"].astype("Int64")
+df["release_date"] = df["release_date"].dt.strftime("%Y-%m-%d")
+df["release_date"] = df["release_date"].fillna("Unknown")
+
+# 8. Xoa cac phim co nam phat hanh tu 2027 den 2099 (chua phat hanh / ngay ao)
+#    [DA SUA LOI] release_year la kieu Int64 (nullable), neu dong bi thieu
+#    nam (NA) thi phep so sanh ">=2027" tra ve <NA> chu khong phai False, va
+#    "df[~future_mask]" se AM THAM loai bo ca cac dong <NA> do (pandas coi
+#    <NA> nhu False khi loc) -> XOA NHAM toan bo phim khong co ngay phat hanh.
+#    Fix: dung .fillna(False) de cac dong thieu nam KHONG bi coi la "future".
+before = len(df)
+future_mask = ((df["release_year"] >= 2027) & (df["release_year"] <= 2099)).fillna(False)
+df = df[~future_mask]
+log["dropped_release_year_2027_2099"] = before - len(df)
+
+# 9. Xoa cac dong la rac/spam (quang cao, so dien thoai "ho tro khach hang",
+#    ky tu mat cuoi/emoji trong ten phim...) - chi xoa khi ĐỒNG THỜI khong co
+#    luot danh gia (vote_count = 0) VA khong co ngay phat hanh, de tranh xoa
+#    nham cac phim that co ky tu cach dieu trong ten (vi du "I <3 Huckabees")
+phone_pattern = re.compile(r"(\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]\d{3}[\s\-.]\d{4}")
+has_phone = df["title"].astype(str).str.contains(phone_pattern)
+
+spam_keywords = ["customer service", "call girls", "onchain wallet", "uphold",
+                  "kraken support", "kraken customer", "toll free", "helpline",
+                  "contact number", "customer support", "phone number",
+                  "wallet support", "wallet login", "restore my", "reactivate my",
+                  "account suspended", "how do i contact", "how to contact",
+                  "support number"]
+kw_pattern = re.compile("|".join(spam_keywords), re.IGNORECASE)
+has_kw = df["title"].astype(str).str.contains(kw_pattern)
+
+emoji_pattern = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U00002602\U00002604-\U000026FF\U00002700-\U000027BF"
+    "\U0001F1E6-\U0001F1FF\U00002B00-\U00002BFF\U0001F900-\U0001F9FF]+", flags=re.UNICODE)
+has_emoji = df["title"].astype(str).str.contains(emoji_pattern)
+
+no_signal = df["vote_count"].fillna(0).eq(0) & df["release_year"].isna()
+spam_mask = (has_phone | has_kw | has_emoji) & no_signal
+
+before = len(df)
+df = df[~spam_mask]
+log["dropped_spam_junk_rows"] = before - len(df)
+
+# 10. Xoa cac cot khong can dung den trong file ket qua
+cols_to_drop = ["backdrop_path", "revenue", "homepage", "poster_path"]
+df = df.drop(columns=cols_to_drop, errors="ignore")
+log["dropped_columns"] = cols_to_drop
+
+log["rows_end"] = len(df)
+log["total_rows_removed"] = n_start - len(df)
+
+df.to_csv(OUTPUT, index=False)
+
+os.makedirs("cleaned", exist_ok=True)
+with open("cleaned/clean_log.json", "w") as f:
+    json.dump(log, f, indent=2, ensure_ascii=False)
+
+print(json.dumps(log, indent=2, ensure_ascii=False))
 
