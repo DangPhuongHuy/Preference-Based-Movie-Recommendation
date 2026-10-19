@@ -1,0 +1,23 @@
+ALTER PROCEDURE dbo.GoiYPhimTheoTheLoai
+    @danh_sach_the_loai NVARCHAR(500),   -- vd: 'Action,Science Fiction'
+    @so_luong INT = 10,
+    @min_vote_count INT = 100
+AS
+BEGIN
+    SELECT TOP (@so_luong)
+        m.id,
+        m.title,
+        m.release_year,
+        m.runtime,
+        m.vote_average,
+        m.vote_count,
+        COUNT(*) AS so_the_loai_khop
+    FROM dbo.TMDB_movie_dataset_cleaned m
+    JOIN dbo.movie_genres g ON m.id = g.movie_id
+    WHERE g.genre IN (SELECT TRIM(value) FROM STRING_SPLIT(@danh_sach_the_loai, ','))
+      AND m.vote_count >= @min_vote_count
+    GROUP BY m.id, m.title, m.release_year, m.runtime, m.vote_average, m.vote_count
+    ORDER BY so_the_loai_khop DESC, m.vote_average DESC;
+END;
+
+EXEC dbo.GoiYPhimTheoTheLoai @danh_sach_the_loai = 'Action,Drama'; # đây là ví dụ , tự thay đổi thể loại được.
